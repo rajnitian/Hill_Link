@@ -1,0 +1,21 @@
+import { Router } from 'express';
+import { createRequest as persistRequest, getRequests, getRequest, getDonors, addAudit, updateRequest } from '../data/store.js';
+import { rankDonors } from '../services/matching.service.js';
+import { requireRole, rateLimitWindow, type AuthRequest } from '../middleware/auth.js';
+import type { BloodGroup, EmergencyRequest, Urgency } from '../types.js';
+import { validateRequestPayload } from '../services/request-validation.service.js';
+const router=Router();
+router.get('/',requireRole('hospital','dispatcher','admin'),async(_req,res)=>res.json((await getRequests()).map(r=>({...r,requesterPhone:'[REDACTED]'}))));
+router.post('/',rateLimitWindow(20),requireRole('hospital','admin'),async(req:AuthRequest,res)=>{
+ const b=req.body??{};const validationError=validateRequestPayload(b);if(validationError)return res.status(400).json({error:validationError});
+ const idem=typeof req.header('Idempotency-Key')==='string'?req.header('Idempotency-Key')!.slice(0,128):undefined;
+ if(idem){const existing=(await getRequests()).find(r=>r.idempotencyKey===idem);if(existing)return res.status(200).json(existing);}
+ const demoMode=process.env.DEMO_MODE!=='false'&&process.env.NODE_ENV!=='production';
+ const created:EmergencyRequest={id:`HL-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`,patientLabel:'Restricted patient record',hospital:b.hospital.trim().slice(0,160),location:b.location.trim().slice(0,240),coordinates:b.coordinates,bloodGroup:b.bloodGroup as BloodGroup,component:b.component,units:Number(b.units),urgency:b.urgency as Urgency,requesterPhone:b.requesterPhone,requiredArrivalAt:new Date(b.requiredArrivalAt).toISOString(),createdAt:new Date().toISOString(),expiresAt:new Date(Math.min(Date.parse(b.requiredArrivalAt),Date.now()+6*3600000)).toISOString(),status:'pending',verified:false,demo:true,idempotencyKey:idem};
+ await persistRequest(created);await addAudit(req.userRole??'demo','request_created',created.id,{demo:true,verified:false});return res.status(201).json(created);
+});
+router.get('/:id/matches',requireRole('hospital','dispatcher','admin'),async(req,res)=>{const request=await getRequest(req.params.id);if(!request)return res.status(404).json({error:'Request not found.'});if(!['pending','matching'].includes(request.status))return res.status(409).json({error:'Request is closed or expired.'});const donors=await getDonors();return res.json(rankDonors(request,donors).map(m=>({...m,donor:(({name,phoneE164,...d})=>({...d,displayName:name}))(m.donor)})));});
+router.post('/:id/verify',requireRole('admin'),async(req:AuthRequest,res)=>{const request=await getRequest(req.params.id);if(!request)return res.status(404).json({error:'Request not found.'});if(req.userRole!=='admin')return res.status(403).json({error:'Only an authorized administrator can record manual verification.'});if(process.env.HOSPITAL_VERIFICATION_MODE!=='manual-reviewed')return res.status(503).json({error:'Hospital verification workflow is not configured.'});request.verified=true;request.demo=false;await updateRequest(request);await addAudit(req.userRole??'hospital','request_verified',request.id,{});return res.json(request);});
+router.post('/:id/cancel',requireRole('hospital','dispatcher','admin'),async(req:AuthRequest,res)=>{const request=await getRequest(req.params.id);if(!request)return res.status(404).json({error:'Request not found.'});if(['completed','cancelled'].includes(request.status))return res.status(409).json({error:'Request is already closed.'});request.status='cancelled';await updateRequest(request);await addAudit(req.userRole??'demo','request_cancelled',request.id,{});return res.json(request);});
+router.post('/:id/complete',requireRole('dispatcher','admin'),async(req:AuthRequest,res)=>{const request=await getRequest(req.params.id);if(!request)return res.status(404).json({error:'Request not found.'});if(request.status!=='ambulance_assigned')return res.status(409).json({error:'Only an ambulance-assigned request can be marked completed.'});request.status='completed';await updateRequest(request);await addAudit(req.userRole??'dispatcher','request_completed',request.id,{});return res.json(request);});
+export default router;

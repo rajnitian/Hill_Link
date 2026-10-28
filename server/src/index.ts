@@ -1,0 +1,18 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import requestsRouter from './routes/requests.js';
+import donorsRouter from './routes/donors.js';
+import notificationsRouter from './routes/notifications.js';
+import routingRouter from './routes/routing.js';
+import ambulancesRouter from './routes/ambulances.js';
+import { isPersistent } from './data/store.js';
+import { rateLimitWindow } from './middleware/auth.js';
+const app=express();const port=Number(process.env.PORT||4000);const demoMode=process.env.DEMO_MODE!=='false'&&process.env.NODE_ENV!=='production';
+app.disable('x-powered-by');app.use(cors({origin:(process.env.CLIENT_ORIGIN||'http://localhost:5173').split(',').map(s=>s.trim())}));app.use(express.json({limit:'50kb'}));app.use('/api',rateLimitWindow(180));
+app.get('/api/health',(_req,res)=>res.json({status:'ok',mode:demoMode?'demo':'production',database:isPersistent()?'postgres':'in-memory-demo',liveSms:false,liveRouting:false,liveWeather:false,liveDispatch:false}));
+app.use('/api/requests',requestsRouter);app.use('/api/donors',donorsRouter);app.use('/api/notifications',notificationsRouter);app.use('/api/routing',routingRouter);app.use('/api/ambulances',ambulancesRouter);
+app.use((_req,res)=>res.status(404).json({error:'Route not found.'}));
+app.use((err:unknown,_req:express.Request,res:express.Response,_next:express.NextFunction)=>{const message=err instanceof Error?err.message:'Unknown server error';if(process.env.NODE_ENV!=='production')console.error('Request failed:',message);res.status(500).json({error:'Internal server error.'});});
+if(process.env.NODE_ENV==='production'&&!process.env.DATABASE_URL)throw new Error('DATABASE_URL is required in production; refusing to start with in-memory demo data.');
+app.listen(port,()=>console.log(`HillLink API listening on port ${port}; mode=${demoMode?'demo':'production'}; persistent=${isPersistent()}`));

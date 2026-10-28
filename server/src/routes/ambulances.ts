@@ -1,0 +1,24 @@
+import { Router } from 'express';
+import { ambulances } from '../data/demoData.js';
+import { getRequest, getDonor, addAudit } from '../data/store.js';
+import { estimateRoadRoute } from '../services/routing.service.js';
+import { claimDemoAmbulanceAtomically } from '../services/ambulance.service.js';
+import { isPersistent } from '../data/store.js';
+import { requireRole, type AuthRequest } from '../middleware/auth.js';
+const router=Router();
+router.get('/',requireRole('dispatcher','admin'),(_req,res)=>res.json(ambulances.map(a=>({...a,mode:'DEMO'}))));
+router.get('/feasible',requireRole('dispatcher','admin'),async(req,res)=>{const requestId=typeof req.query.requestId==='string'?req.query.requestId:'';if(!requestId)return res.status(400).json({error:'requestId is required.'});const request=await getRequest(requestId);if(!request)return res.status(404).json({error:'Request not found.'});if(request.status!=='donor_accepted'||!request.acceptedDonorId)return res.status(409).json({error:'A donor must accept before ambulance feasibility is calculated.'});const donor=await getDonor(request.acceptedDonorId);if(!donor)return res.status(409).json({error:'Donor pickup location is unavailable.'});const deadlineMinutes=(Date.parse(request.requiredArrivalAt)-Date.now())/60000;const candidates=ambulances.filter(a=>a.available).map(a=>{const pickupRoute=estimateRoadRoute(a.coordinates,donor.coordinates);const hospitalRoute=estimateRoadRoute(donor.coordinates,request.coordinates);const reachable=pickupRoute.reachable&&hospitalRoute.reachable;const etaMinutes=reachable?pickupRoute.etaMinutes+hospitalRoute.etaMinutes:null;return {ambulanceId:a.id,label:a.label,reachable,etaMinutes,canMeetDeadline:etaMinutes!==null&&etaMinutes<=deadlineMinutes,pickupRoute,hospitalRoute,locationConfidence:a.locationConfidence};}).sort((a,b)=>Number(b.canMeetDeadline)-Number(a.canMeetDeadline)||(a.etaMinutes??Infinity)-(b.etaMinutes??Infinity));return res.json({requestId,mode:'DEMO',candidates,deadlineMinutes,dispatchProviderConfirmed:false});});
+router.post('/assign',requireRole('dispatcher','admin'),async(req:AuthRequest,res)=>{
+ const {requestId,ambulanceId,confirmDispatch}=req.body??{};if(typeof requestId!=='string'||typeof ambulanceId!=='string')return res.status(400).json({error:'requestId and ambulanceId are required.'});
+ if(confirmDispatch!==true)return res.status(400).json({error:'Explicit dispatcher confirmation is required.'});
+ if(req.userRole==='demo')return res.status(403).json({error:'Demo role cannot dispatch an ambulance.'});
+ if(isPersistent())return res.status(503).json({error:'Persistent ambulance inventory and transactional vehicle reservation are not configured.'});const request=await getRequest(requestId);if(!request)return res.status(404).json({error:'Request not found.'});if(request.status!=='donor_accepted')return res.status(409).json({error:'A donor must accept before ambulance assignment.'});
+ const ambulance=ambulances.find(a=>a.id===ambulanceId);if(!ambulance||!ambulance.available)return res.status(409).json({error:'Ambulance is unavailable.'});
+ const donorId=request.acceptedDonorId;if(!donorId)return res.status(409).json({error:'No accepted donor pickup point is recorded.'});
+ const donor=await getDonor(donorId);if(!donor)return res.status(409).json({error:'Donor pickup location is unavailable.'});
+ const pickupRoute=estimateRoadRoute(ambulance.coordinates,donor.coordinates);const hospitalRoute=estimateRoadRoute(donor.coordinates,request.coordinates);if(!pickupRoute.reachable||!hospitalRoute.reachable)return res.status(409).json({error:'No safe route available in demo road graph.'});
+ const totalEta=pickupRoute.etaMinutes+hospitalRoute.etaMinutes;const deadlineMinutes=(Date.parse(request.requiredArrivalAt)-Date.now())/60000;if(totalEta>deadlineMinutes)return res.status(409).json({error:'Demo road estimate misses the operational deadline.'});
+ const claim=claimDemoAmbulanceAtomically(requestId,ambulanceId);if(!claim.ok)return res.status(409).json({error:`Ambulance assignment not applied: ${claim.reason}`});await addAudit(req.userRole??'dispatcher','ambulance_assignment_demo',request.id,{ambulanceId,etaMinutes:totalEta,dispatchConfirmed:true});
+ return res.json({requestId,ambulanceId,mode:'DEMO',status:'assignment_simulated',pickupRoute,hospitalRoute,etaMinutes:totalEta,dispatchProviderConfirmed:false,message:'Assignment is simulated. No emergency vehicle was dispatched.'});
+});
+export default router;
